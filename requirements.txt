@@ -1,0 +1,10 @@
+web3==6.15.1
+requests==2.31.0
+python-dotenv==1.0.1
+python-telegram-bot==20.6
+eth-account==0.11.3
+bip-utils==2.9.3
+eth-abi
+eth-utils
+awscli==1.42.13
+boto3==1.40.13
