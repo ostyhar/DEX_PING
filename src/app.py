@@ -310,10 +310,28 @@ def lambda_handler(event: dict, context: Any=None) -> dict:
     return {"results": results}
 
 if __name__ == "__main__":
-    # локальний швидкий тест: читати payload із stdin або файлу
     import sys
-    data = sys.stdin.read().strip()
+    data = {
+        "version": 1,
+        "event": "univ3.pool.created",
+        "chainId": 1,
+        "pool": "0x7bc5c9dE2DFe90CFE1e01967096915ba8ea1Bc53",
+        "token": "0x6c5bA91642F10282b576d91922Ae6448C9d52f4E",
+        "quote": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+        "fee": 10000,
+        "createdBlock": 15561122,
+        "createdBlockHash": "0x633f0d257cf64d5831d0b12c6ba66e9a72a754436f651fb2c7e98e670f8e429e",
+        "createdTx": "0x5911e2ec786e5cd3d8896b1e1287d04d17666b8273506b3e7363389db64bf6dc",
+        "initialized": "true",
+        "init": {
+            "blockNumber": 15561122,
+            "txHash": "0x5911e2ec786e5cd3d8896b1e1287d04d17666b8273506b3e7363389db64bf6dc",
+            "sqrtPriceX96": "657192322148935038807894396",
+            "tick": -95847
+        },
+        "idempotencyKey": "0x5bc8ea9ec90e036c8d560fedad680c87927729110779037e320fe3e3756f0388"
+    }
     if data:
-        print(lambda_handler(json.loads(data)))
+        print(lambda_handler(data))
     else:
         print("Provide JSON payload on stdin (single event or SQS Records).")
