@@ -1,414 +1,319 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-dex-ping — SQS -> QuoterV2 probe -> SQS (+ Telegram)
-----------------------------------------------------
-
-Приймає події від dex-monitor (univ3.pool.created), робить квоту exactInputSingle
-на суму TARGET_SWAP_AMOUNT (у людських одиницях котирувальника), та якщо пул «готовий»
-(квота не реверта і amountOut > 0), публікує подію 'univ3.pool.ping.ok' у SQS
-для dex-swapper і надсилає повідомлення в Telegram.
-
-ENV (приклад):
-  # RPC
-  RPC_URL=https://mainnet.infura.io/v3/<...>
-
-  # Вхід/вихідні черги
-  # (цей скрипт тригериться SQS-входом через Lambda;
-  #  а у вихід — шле готову подію для dex-swapper)
-  SQS_OUT_URL=https://sqs.eu-west-1.amazonaws.com/123/NewDexPings.fifo
-
-  # Квота
-  TARGET_SWAP_AMOUNT=100.0       # У ЛЮДСЬКИХ одиницях котирувальника (USDT/USDC/WETH)
-  PROBE_PCT_BPS=0                # Напр., 100 = 1%. 0 = вимкнено
-  MAX_IMPACT_BPS=0               # Ліміт імпакту між probe та основною сумою. 0 = вимкнено
-  MIN_EXPECTED_OUT=0             # Мін. кількість таргет-токенів з квоти. 0 = вимкнено
-
-  # TG
-  TELEGRAM_BOT_TOKEN=...
-  TELEGRAM_CHAT_ID=...
-  TELEGRAM_DISABLE_WEB_PAGE_PREVIEW=1
-
-Примітки:
-- Використовуємо quoteSymbol з payload монітора, якщо є — менше RPC, краща консистентність.
-- Прокидуємо createdBlockHash у вихідний payload для відсікання реоргів далі по конвеєру.
+dex-ping — SQS -> QuoterV2/V1 dry-run quote -> (DynamoDB swap_events) + Telegram
+-------------------------------------------------------------------------------
+• Слухає NewDexTokens.fifo (payload від dex-monitor)
+• Для кожного пулу робить DRY квоту (без реального свопу) під TARGET_SWAP_AMOUNT
+• Якщо квота успішна і amountOut>0 — пише запис у DynamoDB (status=ping_ready) + TG
+• Якщо реверт/нуль — status=ping_failed з причиною (+ TG)
 """
 
 from __future__ import annotations
-import os, json, time
+import os
+import json
+import time
 from decimal import Decimal, getcontext
 from typing import Any, Dict, Optional, Tuple
 
 import boto3
-from botocore.exceptions import ClientError
 from web3 import Web3
-from web3.types import TxParams
-from web3.types import HexBytes
 from dotenv import load_dotenv
 
 load_dotenv()
-
-# -------- Precision --------
 getcontext().prec = 48
 
-# -------- Uniswap addresses (Ethereum mainnet) --------
-QUOTER_V2 = Web3.to_checksum_address("0x61fFE014bA17989E743c5F6cB21bF9697530B21e")
+# ---------- Uniswap addresses ----------
+FACTORY     = Web3.to_checksum_address("0x1F98431c8aD98523631AE4a59f267346ea31F984")
+QUOTER_V2   = Web3.to_checksum_address("0x61fFE014bA17989E743c5F6cB21bF9697530B21e")
+QUOTER_V1   = Web3.to_checksum_address("0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6")
+SWAP_ROUTER = Web3.to_checksum_address("0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45")
 
-# -------- Minimal ABIs --------
-ERC20_DECIMALS_ABI = [{
-    "constant": True, "inputs": [], "name": "decimals",
-    "outputs": [{"name": "", "type": "uint8"}],
-    "stateMutability": "view", "type": "function"
-}]
+# sqrt(price) hard limits (із Uniswap v3)
+MIN_SQRT_RATIO = 4295128739
+MAX_SQRT_RATIO = 1461446703485210103287273052203988822378723970342
 
-# string/bytes32 symbol fallbacks
-ERC20_SYMBOL_ABIS = [
-    {"name":"symbol","outputs":[{"type":"string"}],"inputs":[],"stateMutability":"view","type":"function"},
-    {"name":"symbol","outputs":[{"type":"bytes32"}],"inputs":[],"stateMutability":"view","type":"function"},
+# ---------- ABIs (мінімально необхідні) ----------
+ERC20_ABI = [
+    {"name": "decimals", "type": "function", "stateMutability": "view", "inputs": [], "outputs":[{"type":"uint8"}]},
 ]
 
-# QuoterV2: quoteExactInputSingle
 QUOTER_V2_ABI = [{
-   "type":"function","stateMutability":"view","name":"quoteExactInputSingle",
-   "inputs":[{"name":"params","type":"tuple","components":[
-       {"name":"tokenIn","type":"address"},
-       {"name":"tokenOut","type":"address"},
-       {"name":"fee","type":"uint24"},
-       {"name":"amountIn","type":"uint256"},
-       {"name":"sqrtPriceLimitX96","type":"uint160"}
-   ]}],
-   "outputs":[
-       {"name":"amountOut","type":"uint256"},
-       {"name":"sqrtPriceX96After","type":"uint160"},
-       {"name":"initializedTicksCrossed","type":"uint32"}
-   ]
+  "type":"function","stateMutability":"view","name":"quoteExactInputSingle",
+  "inputs":[{"name":"params","type":"tuple","components":[
+      {"name":"tokenIn","type":"address"},
+      {"name":"tokenOut","type":"address"},
+      {"name":"fee","type":"uint24"},
+      {"name":"amountIn","type":"uint256"},
+      {"name":"sqrtPriceLimitX96","type":"uint160"}
+  ]}],
+  "outputs":[
+      {"name":"amountOut","type":"uint256"},
+      {"name":"sqrtPriceX96After","type":"uint160"},
+      {"name":"initializedTicksCrossed","type":"uint32"}
+  ]
 }]
 
+QUOTER_V1_ABI = [{
+  "type":"function","stateMutability":"nonpayable","name":"quoteExactInputSingle",
+  "inputs":[
+    {"name":"tokenIn","type":"address"},
+    {"name":"tokenOut","type":"address"},
+    {"name":"fee","type":"uint24"},
+    {"name":"amountIn","type":"uint256"},
+    {"name":"sqrtPriceLimitX96","type":"uint160"}
+  ],
+  "outputs":[{"name":"amountOut","type":"uint256"}]
+}]
+
+FACTORY_ABI = [{"name":"getPool","type":"function","stateMutability":"view",
+                "inputs":[{"type":"address"},{"type":"address"},{"type":"uint24"}],
+                "outputs":[{"type":"address"}]}]
+
 # ---------- ENV ----------
-RPC_URL = os.getenv("RPC_URL", "").strip()
-SQS_OUT_URL = os.getenv("SQS_OUT_URL", "").strip()
+RPC_URL   = os.getenv("RPC_URL","").strip()
+DYNAMO_TABLE = os.getenv("LOCK_TABLE","swap_events").strip()
 
-TARGET_SWAP_AMOUNT = Decimal(os.getenv("TARGET_SWAP_AMOUNT", "100"))
-PROBE_PCT_BPS = int(os.getenv("PROBE_PCT_BPS", "0"))          # 0=off, else e.g. 100=1%
-MAX_IMPACT_BPS = int(os.getenv("MAX_IMPACT_BPS", "0"))        # 0=off
-MIN_EXPECTED_OUT = Decimal(os.getenv("MIN_EXPECTED_OUT", "0"))# 0=off (у люд. одиницях таргет-токена)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","").strip()
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID","").strip()
+TELEGRAM_DISABLE_WEB_PAGE_PREVIEW = os.getenv("TELEGRAM_DISABLE_WEB_PAGE_PREVIEW","1") not in ("0","false","False")
 
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-TG_DISABLE_PREVIEW = os.getenv("TELEGRAM_DISABLE_WEB_PAGE_PREVIEW", "1").lower() not in ("0","false","no")
-ETHERSCAN_BASE = os.getenv("ETHERSCAN_BASE", "https://etherscan.io").rstrip("/")
-UNISWAP_APP_BASE = os.getenv("UNISWAP_APP_BASE", "https://app.uniswap.org").rstrip("/")
+# Скільки котирувати (людські одиниці квот-токена, напр. 1.0 USDT або 0.2 WETH)
+TARGET_SWAP_AMOUNT = Decimal(os.getenv("TARGET_SWAP_AMOUNT","0") or "0")
+# Якщо базова квота впала — зробити пробу на PROBE_BPS від суми (напр. 500 = 5%)
+PROBE_BPS = int(os.getenv("PROBE_BPS","500") or "0")
 
-# ---------- Boto ----------
-sqs = boto3.client("sqs")
-
-# ---------- Web3 ----------
-if not RPC_URL:
-    raise RuntimeError("RPC_URL is required")
+# ---------- Clients ----------
 w3 = Web3(Web3.HTTPProvider(RPC_URL, request_kwargs={"timeout": 15}))
 if not w3.is_connected():
     raise RuntimeError("Web3 connection failed. Check RPC_URL")
 
 quoter_v2 = w3.eth.contract(address=QUOTER_V2, abi=QUOTER_V2_ABI)
+quoter_v1 = w3.eth.contract(address=QUOTER_V1, abi=QUOTER_V1_ABI)
+factory    = w3.eth.contract(address=FACTORY,  abi=FACTORY_ABI)
+
+dynamodb = boto3.resource("dynamodb")
+lock_table = dynamodb.Table(DYNAMO_TABLE)
 
 # ---------- Helpers ----------
-def escape_html(s: str) -> str:
-    return str(s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-
-def erc20(address: str, abi) -> Any:
-    return w3.eth.contract(address=Web3.to_checksum_address(address), abi=abi)
+def erc20(address: str):
+    return w3.eth.contract(address=Web3.to_checksum_address(address), abi=ERC20_ABI)
 
 def get_decimals(addr: str) -> int:
     try:
-        return int(erc20(addr, ERC20_DECIMALS_ABI).functions.decimals().call())
+        return int(erc20(addr).functions.decimals().call())
     except Exception:
         return 18
 
-_SYMBOL_CACHE: Dict[str,str] = {}
-def get_symbol(addr: str) -> str:
-    if addr in _SYMBOL_CACHE:
-        return _SYMBOL_CACHE[addr]
-    for abi in ERC20_SYMBOL_ABIS:
-        try:
-            c = erc20(addr, [abi])
-            val = c.functions.symbol().call()
-            if isinstance(val, (bytes, bytearray)):
-                try:
-                    val = val.rstrip(b"\x00").decode("utf-8")
-                except Exception:
-                    continue
-            s = str(val).strip()
-            if s:
-                _SYMBOL_CACHE[addr] = s
-                return s
-        except Exception:
-            continue
-    _SYMBOL_CACHE[addr] = addr
-    return addr
-
-def human_to_wei(x: Decimal, decimals: int) -> int:
-    q = (x * (Decimal(10) ** decimals)).to_integral_value()
-    return int(q)
-
-def wei_to_human(x_wei: int, decimals: int) -> Decimal:
-    return (Decimal(x_wei) / (Decimal(10) ** decimals))
-
-def short_addr(a: str) -> str:
-    a = Web3.to_checksum_address(a)
-    return a[:6] + "…" + a[-4:]
-
-def send_telegram(html: str, max_tries: int = 3):
-    if not (TG_TOKEN and TG_CHAT):
+def send_telegram(html: str) -> None:
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return
-    import urllib.request, urllib.error, json as _json
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    import urllib.request, json as _json
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": TG_CHAT,
+        "chat_id": TELEGRAM_CHAT_ID,
         "text": html,
         "parse_mode": "HTML",
-        "disable_web_page_preview": TG_DISABLE_PREVIEW
+        "disable_web_page_preview": TELEGRAM_DISABLE_WEB_PAGE_PREVIEW,
     }
-    data = _json.dumps(payload).encode("utf-8")
-    for i in range(max_tries):
+    req = urllib.request.Request(url, data=_json.dumps(payload).encode("utf-8"),
+                                 headers={"Content-Type":"application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+    except Exception:
+        pass
+
+def human_amount(x_wei: int, decimals: int, places: str="1.000000") -> Decimal:
+    return (Decimal(x_wei) / (Decimal(10) ** Decimal(decimals))).quantize(Decimal(places))
+
+def price_str(amount_in_wei: int, in_dec: int, amount_out_wei: int, out_dec: int) -> str:
+    try:
+        ain = Decimal(amount_in_wei)  / (Decimal(10) ** in_dec)
+        aout= Decimal(amount_out_wei) / (Decimal(10) ** out_dec)
+        if aout > 0:
+            px = ain / aout
+            return f"{px:.8f}"
+    except Exception:
+        pass
+    return "n/a"
+
+def format_ok_html(ev: dict, amount_in_h: Decimal, out_h: Decimal, px: str) -> str:
+    name = ev.get("name") or ev.get("token") or "?"
+    fee  = ev.get("fee")
+    pool = ev.get("pool")
+    parts = [
+        f"✅ <b>DEX Ping</b> • {name}",
+        f"💱 fee: <code>{fee}</code>",
+        f"📥 in: <code>{amount_in_h}</code> ➜ 📦 out: <code>{out_h}</code>",
+        f"💵 px: <code>{px}</code>",
+    ]
+    if pool:
+        parts.append(f"🔗 <a href=\"https://etherscan.io/address/{pool}\">pool</a>")
+    return "\n".join(parts)
+
+def format_fail_html(ev: dict, err: str) -> str:
+    name = ev.get("name") or ev.get("token") or "?"
+    fee  = ev.get("fee")
+    pool = ev.get("pool")
+    parts = [
+        f"❌ <b>DEX Ping failed</b> • {name}",
+        f"💱 fee: <code>{fee}</code>",
+        f"⚠️ {err}",
+    ]
+    if pool:
+        parts.append(f"🔗 <a href=\"https://etherscan.io/address/{pool}\">pool</a>")
+    return "\n".join(parts)
+
+def ddb_put_status(idem: str, status: str, payload: dict) -> None:
+    item = {"id": idem or f"no_idem_{int(time.time())}", "status": status, "ts": int(time.time()), **payload}
+    lock_table.put_item(Item=item)
+
+def get_pool_and_direction(token_in: str, token_out: str, fee: int) -> Tuple[str, bool, int]:
+    """
+    Повертає (pool, oneForZero, sqrt_limit)
+    • oneForZero=True: продаємо token1 за token0  -> sqrt_limit = MAX_SQRT_RATIO-1
+    • oneForZero=False: продаємо token0 за token1 -> sqrt_limit = MIN_SQRT_RATIO+1
+    """
+    t_in  = Web3.to_checksum_address(token_in)
+    t_out = Web3.to_checksum_address(token_out)
+    pool  = factory.functions.getPool(t_in, t_out, int(fee)).call()
+    if int(pool, 16) == 0:
+        raise RuntimeError("No pool for (tokenIn, tokenOut, fee)")
+
+    # Uniswap v3 впорядковує адреси (token0 < token1)
+    t0 = min(t_in, t_out)
+    t1 = max(t_in, t_out)
+    one_for_zero = (t_in == t1 and t_out == t0)
+    sqrt_limit = (MAX_SQRT_RATIO - 1) if one_for_zero else (MIN_SQRT_RATIO + 1)
+    return pool, one_for_zero, sqrt_limit
+
+def quote_single(token_in: str, token_out: str, fee: int, amount_in: int, sqrt_limit: int) -> Tuple[int, Optional[str]]:
+    """
+    Повертає (amountOut, err). Спочатку QuoterV2, фолбек — QuoterV1.
+    """
+    t_in  = Web3.to_checksum_address(token_in)
+    t_out = Web3.to_checksum_address(token_out)
+    f     = int(fee)
+    amt   = int(amount_in)
+    try:
+        params = (t_in, t_out, f, amt, int(sqrt_limit))
+        out, _, _ = quoter_v2.functions.quoteExactInputSingle(params).call()
+        return int(out), None
+    except Exception as e_v2:
         try:
-            req = urllib.request.Request(url, data=data, headers={"Content-Type":"application/json"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                resp.read()
-            return
-        except urllib.error.HTTPError as e:
-            if e.code in (429,500,502,503,504):
-                time.sleep(2**i)
-                continue
-            raise
-        except Exception:
-            if i < max_tries-1:
-                time.sleep(2**i)
-                continue
-            raise
-
-def quoter_v2_exact_input_single(token_in: str, token_out: str, fee: int, amount_in_wei: int) -> Tuple[int,int,int]:
-    params = (
-        Web3.to_checksum_address(token_in),
-        Web3.to_checksum_address(token_out),
-        int(fee),
-        int(amount_in_wei),
-        0  # sqrtPriceLimitX96
-    )
-    out, sqrt_after, ticks = quoter_v2.functions.quoteExactInputSingle(params).call()
-    return int(out), int(sqrt_after), int(ticks)
-
-def calc_impact_bps(px_small: Decimal, px_big: Decimal) -> int:
-    if px_small <= 0:
-        return 0
-    # impact = (px_big - px_small)/px_small * 10000
-    diff = (px_big - px_small) / px_small
-    return int((diff * Decimal(10000)).to_integral_value())
+            out = quoter_v1.functions.quoteExactInputSingle(t_in, t_out, f, amt, int(sqrt_limit)).call()
+            return int(out), None
+        except Exception as e_v1:
+            return 0, f"revert (v2:{str(e_v2)}) (v1:{str(e_v1)})"
 
 # ---------- Core ----------
-def format_tg_success(ev: dict,
-                      quote_symbol_display: str,
-                      amount_in_h: Decimal,
-                      amount_out_h: Decimal,
-                      px_q_per_t: Decimal,
-                      probe_impact_bps: Optional[int]) -> str:
-    token_addr = Web3.to_checksum_address(ev["token"])
-    pool       = Web3.to_checksum_address(ev["pool"])
-    fee        = int(ev["fee"])
-    txh        = str(ev.get("createdTx") or "")
-    qsym       = escape_html(quote_symbol_display)
-
-    lines = []
-    lines.append("✅ <b>Ping OK</b> • Uniswap V3")
-    lines.append(f"💱 <b>{short_addr(token_addr)}</b> / <b>{qsym}</b> • fee <code>{fee}</code>")
-    lines.append(f"💵 in: <code>{amount_in_h.normalize()}</code> {qsym}")
-    lines.append(f"📦 out: <code>{amount_out_h.normalize()}</code> tokens")
-    lines.append(f"🔢 px: <code>{px_q_per_t.normalize()}</code> {qsym}/token")
-    if probe_impact_bps is not None:
-        lines.append(f"📉 impact (probe→full): <code>{probe_impact_bps}</code> bps")
-    links = []
-    links.append(f'<a href="{ETHERSCAN_BASE}/address/{pool}">pool</a>')
-    if txh:
-        links.append(f'<a href="{ETHERSCAN_BASE}/tx/{txh}">tx</a>')
-    links.append(f'<a href="{UNISWAP_APP_BASE}/explore/pools/ethereum/{pool}">app</a>')
-    lines.append("\n🔗 " + " · ".join(links))
-    return "\n".join(lines)
-
-def publish_ping_ok_to_sqs(ev: dict,
-                           amount_in_wei: int,
-                           amount_out_wei: int,
-                           price_q_per_t_wei_scaled: int,
-                           probe_impact_bps: Optional[int]) -> None:
-    if not SQS_OUT_URL:
-        print("[WARN] SQS_OUT_URL not set; skipping publish")
-        return
-    payload = {
-        "version": 1,
-        "event": "univ3.pool.ping.ok",
-        "chainId": int(ev.get("chainId", 1)),
-        "pool": ev["pool"],
-        "token": ev["token"],
-        "quote": ev["quote"],
-        # символьний тікер від монітора (якщо був)
-        "quoteSymbol": (ev.get("quoteSymbol") or "").strip() or None,
-        "fee": int(ev["fee"]),
-        "createdBlock": int(ev.get("createdBlock", 0)),
-        "createdBlockHash": ev.get("createdBlockHash"),
-        "createdTx": ev.get("createdTx"),
-        "initialized": bool(ev.get("initialized")),
-        # квота
-        "amountIn": str(amount_in_wei),
-        "amountOut": str(amount_out_wei),
-        "priceQperT_scaled": str(price_q_per_t_wei_scaled),  # див. примітку нижче
-        # опційно — метрика імпакту
-        "probeImpactBps": int(probe_impact_bps) if probe_impact_bps is not None else None,
-        # додаткове: корисно для idempotency далі
-        "idempotencyKey": ev.get("idempotencyKey"),
-    }
-    # Group & dedupe: групуємо за пулом (або за токеном — на смак)
-    group_id = Web3.to_checksum_address(ev["pool"])
-    dedup_id = (ev.get("idempotencyKey")
-                or Web3.keccak(text="|".join([
-                    str(payload["chainId"]), payload["pool"], payload["token"],
-                    payload["quote"], str(payload["fee"]), str(payload["createdTx"] or "")
-                ])).hex())
-    sqs.send_message(
-        QueueUrl=SQS_OUT_URL,
-        MessageBody=json.dumps(payload),
-        MessageGroupId=group_id,
-        MessageDeduplicationId=dedup_id
-    )
-    print("[SQS OUT] published", dedup_id)
-
-def handle_pool_created(ev: dict) -> dict:
-    """
-    Обробляє payload від dex-monitor (univ3.pool.created).
-    Повертає {"ok": True} якщо квота пройшла фільтри і подію опубліковано.
-    """
-    # Базова валідація
-    if str(ev.get("event")) != "univ3.pool.created":
-        return {"skipped": "unknown_event"}
+def handle_ping_event(ev: dict) -> dict:
+    # очікуємо payload від dex-monitor
     for k in ("pool","token","quote","fee"):
         if not ev.get(k):
-            return {"skipped": f"missing_{k}"}
+            return {"skipped":"bad_payload"}
 
-    token = Web3.to_checksum_address(ev["token"])   # таргет
-    quote = Web3.to_checksum_address(ev["quote"])   # котирувальник
-    fee   = int(ev["fee"])
+    if TARGET_SWAP_AMOUNT <= 0:
+        return {"skipped":"target_amount_not_set"}
 
-    # Символ котирувальника: віддаємо пріоритет полю з монітора
-    provided_qsym = (ev.get("quoteSymbol") or "").strip()
-    quote_symbol = provided_qsym or get_symbol(quote)
+    # in-amount у wei (за QUOTE-токеном)
+    q_dec = get_decimals(ev["quote"])
+    amount_in = int((TARGET_SWAP_AMOUNT * (Decimal(10) ** q_dec)).to_integral_value())
 
-    # Decimals
-    q_dec = get_decimals(quote)
-    t_dec = get_decimals(token)
-
-    # amountIn (wei)
-    amount_in_h = Decimal(TARGET_SWAP_AMOUNT)
-    amount_in_wei = human_to_wei(amount_in_h, q_dec)
-
-    # ---- Основна квота ----
+    # Визначаємо напрямок і коректний sqrt limit
     try:
-        amount_out_wei, sqrt_after, ticks = quoter_v2_exact_input_single(token, quote, fee, amount_in_wei)
+        _pool_ok, _dir, sqrt_limit = get_pool_and_direction(ev["quote"], ev["token"], int(ev["fee"]))
     except Exception as e:
-        return {"skipped": f"quoter_revert: {e}"}
+        ddb_put_status(ev.get("idempotencyKey","n/a"), "ping_failed", {"pool": ev.get("pool"), "error": str(e)})
+        send_telegram(format_fail_html(ev, f"pool/direction: {e}"))
+        return {"error": str(e)}
 
-    if amount_out_wei <= 0:
-        return {"skipped": "zero_amount_out"}
+    # Основна квота
+    out, err = quote_single(ev["quote"], ev["token"], int(ev["fee"]), amount_in, sqrt_limit)
+    used_amount = amount_in
+    used_probe  = False
 
-    # Мінімальний out-фільтр (у людських одиницях таргет-токена)
-    amount_out_h = wei_to_human(amount_out_wei, t_dec)
-    if MIN_EXPECTED_OUT > 0 and amount_out_h < MIN_EXPECTED_OUT:
-        return {"skipped": f"min_expected_out_not_met: got {amount_out_h}, need >= {MIN_EXPECTED_OUT}"}
+    # Якщо реверт або out==0 — «маленька проба»
+    if (out <= 0 or err) and PROBE_BPS > 0:
+        probe_amt = max(1, (amount_in * int(PROBE_BPS)) // 10_000)
+        out2, err2 = quote_single(ev["quote"], ev["token"], int(ev["fee"]), probe_amt, sqrt_limit)
+        if out2 > 0 and not err2:
+            out, err = out2, None
+            used_amount = probe_amt
+            used_probe  = True
+        else:
+            ddb_put_status(ev.get("idempotencyKey","n/a"), "ping_failed", {
+                "pool": ev.get("pool"),
+                "token": ev.get("token"),
+                "quote": ev.get("quote"),
+                "fee": int(ev.get("fee")),
+                "error": err2 or err or "quote returned 0",
+                "amount_in": str(amount_in),
+                "probe_bps": PROBE_BPS
+            })
+            send_telegram(format_fail_html(ev, err2 or err or "quote=0"))
+            return {"error": err2 or err or "quote=0"}
 
-    # Ціна (котирувальник за 1 токен)
-    # px = (amountIn / 10^q_dec) / (amountOut / 10^t_dec)
-    if amount_out_h == 0:
-        return {"skipped": "div_by_zero"}
-    px_q_per_t = (amount_in_h / amount_out_h)  # Decimal
+    if out <= 0:
+        ddb_put_status(ev.get("idempotencyKey","n/a"), "ping_failed", {
+            "pool": ev.get("pool"),
+            "token": ev.get("token"),
+            "quote": ev.get("quote"),
+            "fee": int(ev.get("fee")),
+            "error": err or "quote returned 0",
+            "amount_in": str(amount_in),
+            "probe_used": used_probe
+        })
+        send_telegram(format_fail_html(ev, err or "quote=0"))
+        return {"error": err or "quote=0"}
 
-    # (опційно) quick-probe для оцінки імпакту
-    probe_impact_bps: Optional[int] = None
-    if PROBE_PCT_BPS > 0 and MAX_IMPACT_BPS > 0:
-        probe_in_h = (amount_in_h * Decimal(PROBE_PCT_BPS) / Decimal(10000))
-        probe_in_wei = max(1, human_to_wei(probe_in_h, q_dec))
-        try:
-            probe_out_wei, _, _ = quoter_v2_exact_input_single(quote, token, fee, probe_in_wei)
-            if probe_out_wei > 0:
-                probe_out_h = wei_to_human(probe_out_wei, t_dec)
-                px_small = (probe_in_h / probe_out_h) if probe_out_h > 0 else Decimal(0)
-                px_big   = px_q_per_t
-                probe_impact_bps = calc_impact_bps(px_small, px_big)
-                if probe_impact_bps > MAX_IMPACT_BPS:
-                    return {"skipped": f"impact_too_high: {probe_impact_bps}bps > {MAX_IMPACT_BPS}bps"}
-        except Exception:
-            # якщо проба ревертнула — ігноруємо пробу, але це тривожний сигнал
-            probe_impact_bps = None
+    # Красиві числа і ціна
+    t_dec = get_decimals(ev["token"])
+    amount_in_h = human_amount(used_amount, q_dec)
+    out_h       = human_amount(out, t_dec)
+    px_str      = price_str(used_amount, q_dec, out, t_dec)
 
-    # Телеграм — success
-    tg_html = format_tg_success(ev, quote_symbol, amount_in_h, amount_out_h, px_q_per_t, probe_impact_bps)
-    try:
-        send_telegram(tg_html)
-    except Exception as e:
-        print("[WARN] telegram send failed:", e)
+    # Зберігаємо в DDB
+    ddb_put_status(ev.get("idempotencyKey","n/a"), "ping_ready", {
+        "pool": ev.get("pool"),
+        "token": ev.get("token"),
+        "quote": ev.get("quote"),
+        "fee": int(ev.get("fee")),
+        "amount_in": str(used_amount),
+        "amount_out": str(out),
+        "probe_used": used_probe
+    })
 
-    # Для зручності даємо ще «масштабовану» ціну цілим числом (щоб уникати float у споживачів):
-    # priceQperT_scaled = px * 10^q_dec   (тобто скільки "вей котирувальника" за 1 токен)
-    price_q_per_t_scaled = int((px_q_per_t * (Decimal(10) ** q_dec)).to_integral_value())
+    # TG
+    send_telegram(format_ok_html(ev, amount_in_h, out_h, px_str))
+    return {"ok": True, "out": out}
 
-    # Публікуємо в SQS → dex-swapper
-    try:
-        publish_ping_ok_to_sqs(ev, amount_in_wei, int(amount_out_wei), price_q_per_t_scaled, probe_impact_bps)
-    except Exception as e:
-        print("[WARN] sqs publish failed:", e)
-
-    return {"ok": True}
-
-# ---------- Lambda handler ----------
-def lambda_handler(event: Optional[Dict[str, Any]] = None, context: Any = None) -> Dict[str, Any]:
+# ---------- Lambda entry ----------
+def lambda_handler(event: dict, context: Any=None) -> dict:
     """
-    SQS → Lambda batch. Повертаємо "batchItemFailures" для негативних кейсів, щоб SQS міг ретраїти.
+    Працює як SQS-трігер:
+    event = {"Records":[{"body":"{...payload from dex-monitor...}"} , ... ]}
     """
-    failures = []
-    for r in (event or {}).get("Records", []):
-        msg_id = r.get("messageId")
-        try:
-            payload = json.loads(r.get("body") or "{}")
-            res = handle_pool_created(payload)
-            # якщо ми "skipped" — це не помилка, просто неготово/непотрібно
-            if "error" in res:
-                failures.append({"itemIdentifier": msg_id})
-        except Exception as e:
-            print("[ERROR] exception in record:", e)
-            failures.append({"itemIdentifier": msg_id})
-    if failures:
-        return {"batchItemFailures": failures}
-    return {}
+    results = []
+    try:
+        recs = event.get("Records") or []
+        if not recs and isinstance(event, dict) and "pool" in event:
+            # прямий виклик для локального тесту
+            return handle_ping_event(event)
+        for r in recs:
+            body = json.loads(r.get("body") or "{}")
+            results.append(handle_ping_event(body))
+    except Exception as e:
+        results.append({"error": str(e)})
+    return {"results": results}
 
-# ---------- Local debug ----------
 if __name__ == "__main__":
-    # Простий локальний запуск: підстав свій payload нижче або прочитай із файлу/STDIN
-    sample = {
-            "version": 1,
-            "event": "univ3.pool.created",
-            "chainId": 1,
-            "pool": "0x7bc5c9dE2DFe90CFE1e01967096915ba8ea1Bc53",
-            "token": "0x6c5bA91642F10282b576d91922Ae6448C9d52f4E",
-            "quote": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
-            "fee": 10000,
-            "createdBlock": 15561122,
-            "createdBlockHash": "0x633f0d257cf64d5831d0b12c6ba66e9a72a754436f651fb2c7e98e670f8e429e",
-            "createdTx": "0x5911e2ec786e5cd3d8896b1e1287d04d17666b8273506b3e7363389db64bf6dc",
-            "initialized": "true",
-            "init": {
-                "blockNumber": 15561122,
-                "txHash": "0x5911e2ec786e5cd3d8896b1e1287d04d17666b8273506b3e7363389db64bf6dc",
-                "sqrtPriceX96": "657192322148935038807894396",
-                "tick": -95847
-            },
-            "idempotencyKey": "0x5bc8ea9ec90e036c8d560fedad680c87927729110779037e320fe3e3756f0388"
-        }
-    try:
-        print(handle_pool_created(sample))
-    except Exception as e:
-        print("Error:", e)
+    # локальний швидкий тест: читати payload із stdin або файлу
+    import sys
+    data = sys.stdin.read().strip()
+    if data:
+        print(lambda_handler(json.loads(data)))
+    else:
+        print("Provide JSON payload on stdin (single event or SQS Records).")
