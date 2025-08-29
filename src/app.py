@@ -18,6 +18,7 @@ from decimal import Decimal, getcontext
 from typing import Any, Dict, Optional, Tuple
 
 import boto3
+from botocore.exceptions import ClientError
 from web3 import Web3
 from dotenv import load_dotenv
 
@@ -167,8 +168,30 @@ def format_fail_html(ev: dict, err: str) -> str:
     return "\n".join(parts)
 
 def ddb_put_status(idem: str, status: str, payload: dict) -> None:
-    item = {"id": idem or f"no_idem_{int(time.time())}", "status": status, "ts": int(time.time()), **payload}
-    lock_table.put_item(Item=item)
+    """
+    Пише запис у swap_events з простим дедупом: перший запис перемагає.
+    Якщо елемент із таким `id` вже існує — ігноруємо повтор (ретраї SQS тощо).
+    ВАЖЛИВО: ключ таблиці має бути `id` (partition key).
+    """
+    _id = idem or f"no_idem_{int(time.time())}"
+    item = {
+        "id": _id,
+        "status": status,
+        "ts": int(time.time()),
+        **payload,
+    }
+    try:
+        lock_table.put_item(
+            Item=item,
+            ConditionExpression="attribute_not_exists(#id)",
+            ExpressionAttributeNames={"#id": "id"},
+        )
+        print(f"[DDB] put {status} id={_id} OK")
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            print(f"[DDB] duplicate, skip id={_id}")
+        else:
+            raise
 
 def get_pool_and_direction(token_in: str, token_out: str, fee: int) -> Tuple[str, bool, int]:
     """
