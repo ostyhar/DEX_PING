@@ -72,6 +72,14 @@ FACTORY_ABI = [{"name":"getPool","type":"function","stateMutability":"view",
                 "inputs":[{"type":"address"},{"type":"address"},{"type":"uint24"}],
                 "outputs":[{"type":"address"}]}]
 
+
+_SYMBOL_CACHE: dict[str, str] = {}
+
+_ERC20_SYMBOL_ABIS = [
+    {"name":"symbol","outputs":[{"type":"string"}],"inputs":[],"stateMutability":"view","type":"function"},
+    {"name":"symbol","outputs":[{"type":"bytes32"}],"inputs":[],"stateMutability":"view","type":"function"},
+]
+
 # ---------- ENV ----------
 RPC_URL   = os.getenv("RPC_URL","").strip()
 DYNAMO_TABLE = os.getenv("LOCK_TABLE","swap_events").strip()
@@ -107,6 +115,30 @@ def get_decimals(addr: str) -> int:
     except Exception:
         return 18
 
+def get_token_symbol(w3: Web3, addr: str) -> str:
+    addr = Web3.to_checksum_address(addr)
+    if addr in _SYMBOL_CACHE:
+        return _SYMBOL_CACHE[addr]
+    for abi in _ERC20_SYMBOL_ABIS:
+        try:
+            c = w3.eth.contract(address=addr, abi=[abi])
+            val = c.functions.symbol().call()
+            if isinstance(val, (bytes, bytearray)):
+                try:
+                    val = val.rstrip(b"\x00").decode("utf-8")
+                except Exception:
+                    continue
+            sym = str(val).strip()
+            if sym:
+                _SYMBOL_CACHE[addr] = sym
+                return sym
+        except Exception:
+            continue
+    # фолбек — обрізана адреса
+    short = addr[:6] + "…" + addr[-4:]
+    _SYMBOL_CACHE[addr] = short
+    return short
+
 def send_telegram(html: str) -> None:
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return
@@ -140,14 +172,14 @@ def price_str(amount_in_wei: int, in_dec: int, amount_out_wei: int, out_dec: int
         pass
     return "n/a"
 
-def format_ok_html(ev: dict, amount_in_h: Decimal, out_h: Decimal, px: str) -> str:
-    name = ev.get("name") or ev.get("token") or "?"
+def format_ok_html(ev: dict, token:str, quote: str, amount_in_h: Decimal, out_h: Decimal, px: str) -> str:
     fee  = ev.get("fee")
     pool = ev.get("pool")
     parts = [
-        f"✅ <b>DEX Ping</b> • {name}",
+        f"✅ <b>DEX Ping</b> • {token}/{quote}",
         f"💱 fee: <code>{fee}</code>",
-        f"📥 in: <code>{amount_in_h}</code> ➜ 📦 out: <code>{out_h}</code>",
+        f"📥 in: <code>{amount_in_h}</code> {quote}",
+        f"📦 out: <code>{out_h}</code> {token}",
         f"💵 px: <code>{px}</code>",
     ]
     if pool:
@@ -178,7 +210,13 @@ def ddb_put_status(idem: str, status: str, payload: dict) -> None:
         "id": _id,
         "status": status,
         "ts": int(time.time()),
-        **payload,
+        "pool": payload.get("ev").get("pool"),
+        "token": payload.get("ev").get("token"),
+        "quote": payload.get("ev").get("quote"),
+        "fee": payload.get("ev").get("fee"),
+        "amount_in": payload.get("amount_in"),
+        "amount_out": payload.get("amount_out"),
+        "probe_used": payload.get("probe_used")
     }
     try:
         lock_table.put_item(
@@ -187,6 +225,17 @@ def ddb_put_status(idem: str, status: str, payload: dict) -> None:
             ExpressionAttributeNames={"#id": "id"},
         )
         print(f"[DDB] put {status} id={_id} OK")
+        if status == "ping_ready":
+            send_telegram(format_ok_html(
+                payload.get("ev"),
+                payload.get("token"),
+                payload.get("quote"),
+                payload.get("amount_in_h"),
+                payload.get("out_h"),
+                payload.get("px_str")
+            )
+        )
+
     except ClientError as e:
         if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
             print(f"[DDB] duplicate, skip id={_id}")
@@ -242,14 +291,14 @@ def handle_ping_event(ev: dict) -> dict:
         return {"skipped":"target_amount_not_set"}
 
     # in-amount у wei (за QUOTE-токеном)
-    q_dec = get_decimals(ev["quote"])
+    q_dec = get_decimals(ev.get("quote"))
     amount_in = int((TARGET_SWAP_AMOUNT * (Decimal(10) ** q_dec)).to_integral_value())
 
     # Визначаємо напрямок і коректний sqrt limit
     try:
         _pool_ok, _dir, sqrt_limit = get_pool_and_direction(ev["quote"], ev["token"], int(ev["fee"]))
     except Exception as e:
-        ddb_put_status(ev.get("idempotencyKey","n/a"), "ping_failed", {"pool": ev.get("pool"), "error": str(e)})
+        ddb_put_status(ev.get("idempotencyKey","n/a"), "ping_failed", {"ev": ev, "error": str(e)})
         send_telegram(format_fail_html(ev, f"pool/direction: {e}"))
         return {"error": str(e)}
 
@@ -268,10 +317,7 @@ def handle_ping_event(ev: dict) -> dict:
             used_probe  = True
         else:
             ddb_put_status(ev.get("idempotencyKey","n/a"), "ping_failed", {
-                "pool": ev.get("pool"),
-                "token": ev.get("token"),
-                "quote": ev.get("quote"),
-                "fee": int(ev.get("fee")),
+                "ev": ev,
                 "error": err2 or err or "quote returned 0",
                 "amount_in": str(amount_in),
                 "probe_bps": PROBE_BPS
@@ -281,10 +327,7 @@ def handle_ping_event(ev: dict) -> dict:
 
     if out <= 0:
         ddb_put_status(ev.get("idempotencyKey","n/a"), "ping_failed", {
-            "pool": ev.get("pool"),
-            "token": ev.get("token"),
-            "quote": ev.get("quote"),
-            "fee": int(ev.get("fee")),
+            "ev": ev,
             "error": err or "quote returned 0",
             "amount_in": str(amount_in),
             "probe_used": used_probe
@@ -293,24 +336,25 @@ def handle_ping_event(ev: dict) -> dict:
         return {"error": err or "quote=0"}
 
     # Красиві числа і ціна
-    t_dec = get_decimals(ev["token"])
+    t_dec = get_decimals(ev.get("token"))
     amount_in_h = human_amount(used_amount, q_dec)
     out_h       = human_amount(out, t_dec)
     px_str      = price_str(used_amount, q_dec, out, t_dec)
+    sym_out = get_token_symbol(w3, ev.get("token"))
+    sym_in  = ev.get("quote_symbol") or get_token_symbol(w3, ev.get("quote"))
 
     # Зберігаємо в DDB
     ddb_put_status(ev.get("idempotencyKey","n/a"), "ping_ready", {
-        "pool": ev.get("pool"),
-        "token": ev.get("token"),
-        "quote": ev.get("quote"),
-        "fee": int(ev.get("fee")),
+        "ev": ev,
+        "token": sym_out,
+        "quote": sym_in,
         "amount_in": str(used_amount),
         "amount_out": str(out),
-        "probe_used": used_probe
+        "probe_used": used_probe,
+        "amount_in_h": amount_in_h,
+        "out_h": out_h,
+        "px_str": px_str
     })
-
-    # TG
-    send_telegram(format_ok_html(ev, amount_in_h, out_h, px_str))
     return {"ok": True, "out": out}
 
 # ---------- Lambda entry ----------
