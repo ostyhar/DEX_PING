@@ -44,6 +44,9 @@ from botocore.exceptions import ClientError
 from web3 import Web3
 from web3.types import TxParams
 from web3.types import HexBytes
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # -------- Precision --------
 getcontext().prec = 48
@@ -306,7 +309,7 @@ def handle_pool_created(ev: dict) -> dict:
 
     # ---- Основна квота ----
     try:
-        amount_out_wei, sqrt_after, ticks = quoter_v2_exact_input_single(quote, token, fee, amount_in_wei)
+        amount_out_wei, sqrt_after, ticks = quoter_v2_exact_input_single(token, quote, fee, amount_in_wei)
     except Exception as e:
         return {"skipped": f"quoter_revert: {e}"}
 
@@ -386,21 +389,25 @@ def lambda_handler(event: Optional[Dict[str, Any]] = None, context: Any = None) 
 if __name__ == "__main__":
     # Простий локальний запуск: підстав свій payload нижче або прочитай із файлу/STDIN
     sample = {
-        "version": 1,
-        "event": "univ3.pool.created",
-        "chainId": 1,
-        "pool": "0x0000000000000000000000000000000000000000",
-        "token": "0x0000000000000000000000000000000000000000",
-        "quote": "0x0000000000000000000000000000000000000000",
-        "fee": 3000,
-        "createdBlock": 0,
-        "createdBlockHash": None,
-        "createdTx": None,
-        "initialized": True,
-        "idempotencyKey": None,
-        # опційно:
-        # "quoteSymbol": "USDT",
-    }
+            "version": 1,
+            "event": "univ3.pool.created",
+            "chainId": 1,
+            "pool": "0x7bc5c9dE2DFe90CFE1e01967096915ba8ea1Bc53",
+            "token": "0x6c5bA91642F10282b576d91922Ae6448C9d52f4E",
+            "quote": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+            "fee": 10000,
+            "createdBlock": 15561122,
+            "createdBlockHash": "0x633f0d257cf64d5831d0b12c6ba66e9a72a754436f651fb2c7e98e670f8e429e",
+            "createdTx": "0x5911e2ec786e5cd3d8896b1e1287d04d17666b8273506b3e7363389db64bf6dc",
+            "initialized": "true",
+            "init": {
+                "blockNumber": 15561122,
+                "txHash": "0x5911e2ec786e5cd3d8896b1e1287d04d17666b8273506b3e7363389db64bf6dc",
+                "sqrtPriceX96": "657192322148935038807894396",
+                "tick": -95847
+            },
+            "idempotencyKey": "0x5bc8ea9ec90e036c8d560fedad680c87927729110779037e320fe3e3756f0388"
+        }
     try:
         print(handle_pool_created(sample))
     except Exception as e:
