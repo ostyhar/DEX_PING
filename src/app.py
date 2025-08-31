@@ -378,27 +378,26 @@ def lambda_handler(event: dict, context: Any=None) -> dict:
 
 if __name__ == "__main__":
     import sys
-    data = {
-        "version": 1,
-        "event": "univ3.pool.created",
-        "chainId": 1,
-        "pool": "0x7bc5c9dE2DFe90CFE1e01967096915ba8ea1Bc53",
-        "token": "0x6c5bA91642F10282b576d91922Ae6448C9d52f4E",
-        "quote": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
-        "fee": 10000,
-        "createdBlock": 15561122,
-        "createdBlockHash": "0x633f0d257cf64d5831d0b12c6ba66e9a72a754436f651fb2c7e98e670f8e429e",
-        "createdTx": "0x5911e2ec786e5cd3d8896b1e1287d04d17666b8273506b3e7363389db64bf6dc",
-        "initialized": "true",
-        "init": {
-            "blockNumber": 15561122,
-            "txHash": "0x5911e2ec786e5cd3d8896b1e1287d04d17666b8273506b3e7363389db64bf6dc",
-            "sqrtPriceX96": "657192322148935038807894396",
-            "tick": -95847
-        },
-        "idempotencyKey": "0x5bc8ea9ec90e036c8d560fedad680c87927729110779037e320fe3e3756f0388"
+    hit = {
+        'token0': '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
+        'token1': '0xdA5e1988097297dCdc1f90D4dFE7909e847CBeF6',
+        'fee': 10000,
+        'tickSpacing': 200,
+        'pool': '0xCa2e972f081764c30Ae5F012A29D5277EEf33838',
+        'blockNumber': 23260820,
+        'blockHash': '0x6e6a65e48bc0d51a6024ab4fdd1475f258104e3f5488e933f243ee0db2101d46',
+        'txHash': '0xa2a3ee3aef9c80c80a3d44b15bfa17330b88a024a37fece70d08ac7bb0dafc2a',
+        'matched': '0xdA5e1988097297dCdc1f90D4dFE7909e847CBeF6',
+        'quote_symbol': 'WETH',
+        'initialized': True,
+        'init': {
+            'blockNumber': 23260820,
+            'txHash': '0xa2a3ee3aef9c80c80a3d44b15bfa17330b88a024a37fece70d08ac7bb0dafc2a',
+            'sqrtPriceX96': 11204090814846941428091632146247,
+            'tick': 99039
+        }
     }
     if data:
-        print(lambda_handler(data))
+        print(lambda_handler(hit))
     else:
         print("Provide JSON payload on stdin (single event or SQS Records).")
