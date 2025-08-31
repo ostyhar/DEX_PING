@@ -92,6 +92,7 @@ TELEGRAM_DISABLE_WEB_PAGE_PREVIEW = os.getenv("TELEGRAM_DISABLE_WEB_PAGE_PREVIEW
 TARGET_SWAP_AMOUNT = Decimal(os.getenv("TARGET_SWAP_AMOUNT","0") or "0")
 # Якщо базова квота впала — зробити пробу на PROBE_BPS від суми (напр. 500 = 5%)
 PROBE_BPS = int(os.getenv("PROBE_BPS","500") or "0")
+SWAP_SQS_FIFO_URL = os.getenv("SWAP_SQS_FIFO_URL","").strip()
 
 # ---------- Clients ----------
 w3 = Web3(Web3.HTTPProvider(RPC_URL, request_kwargs={"timeout": 15}))
@@ -104,6 +105,7 @@ factory    = w3.eth.contract(address=FACTORY,  abi=FACTORY_ABI)
 
 dynamodb = boto3.resource("dynamodb")
 lock_table = dynamodb.Table(DYNAMO_TABLE)
+sqs = boto3.client("sqs")
 AWS_REGION = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "eu-west-1"
 scheduler = boto3.client("scheduler", region_name=AWS_REGION)
 
@@ -140,6 +142,63 @@ def get_token_symbol(w3: Web3, addr: str) -> str:
     short = addr[:6] + "…" + addr[-4:]
     _SYMBOL_CACHE[addr] = short
     return short
+
+def _make_sqs_dedup_id(payload: dict) -> str:
+    """
+    Стабільний dedup id для FIFO: ураховує ідемпотенсі-ключ монітора, пул, фі і суму in.
+    """
+    ev = payload.get("ev", {}) or {}
+    base = "|".join([
+        str(ev.get("idempotencyKey","")),
+        "ping_ready",
+        str(ev.get("pool","")).lower(),
+        str(ev.get("fee","")),
+        str(payload.get("amount_in","")),
+    ])
+    return Web3.keccak(text=base).hex()
+
+def publish_ping_ready_to_sqs(payload: dict) -> None:
+    """
+    Відправляє повідомлення для dex-swapper про готовність до свопу.
+    Очікує, що payload містить:
+      ev, token(sym), quote(sym), amount_in, amount_out, amount_in_h, out_h, px_str, probe_used
+    """
+    if not SWAP_SQS_FIFO_URL:
+        print("[SQS] SWAP_SQS_FIFO_URL not set — skip publish")
+        return
+    ev = payload.get("ev", {}) or {}
+    body = {
+        "version": 1,
+        "event": "dex.ping.ready",
+        "source": "dex-ping",
+        "chainId": ev.get("chainId", 1),
+        "pool": ev.get("pool"),
+        "token": ev.get("token"),
+        "quote": ev.get("quote"),
+        "fee": ev.get("fee"),
+        "createdBlock": ev.get("createdBlock"),
+        "createdBlockHash": ev.get("createdBlockHash"),
+        "createdTx": ev.get("createdTx"),
+        "idempotencyKey": ev.get("idempotencyKey"),
+        "symbols": {"token": payload.get("token"), "quote": payload.get("quote")},
+        "quoteResult": {
+            "amountIn": str(payload.get("amount_in")),
+            "amountOut": str(payload.get("amount_out")),
+            "amountInHuman": str(payload.get("amount_in_h")),
+            "amountOutHuman": str(payload.get("out_h")),
+            "price": payload.get("px_str"),
+            "probeUsed": bool(payload.get("probe_used")),
+        },
+    }
+    dedup_id = _make_sqs_dedup_id(payload)
+    group_id = ev.get("pool") or (str(ev.get("token","")) + ":" + str(ev.get("quote","")))
+    sqs.send_message(
+        QueueUrl=SWAP_SQS_FIFO_URL,
+        MessageBody=json.dumps(body),
+        MessageGroupId=group_id,
+        MessageDeduplicationId=dedup_id,
+    )
+    print("[SQS] published ping_ready", dedup_id)
 
 def send_telegram(html: str) -> None:
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
@@ -228,15 +287,17 @@ def ddb_put_status(idem: str, status: str, payload: dict) -> None:
         )
         print(f"[DDB] put {status} id={_id} OK")
         if status == "ping_ready":
-            send_telegram(format_ok_html(
-                payload.get("ev"),
-                payload.get("token"),
-                payload.get("quote"),
-                payload.get("amount_in_h"),
-                payload.get("out_h"),
-                payload.get("px_str")
+            send_telegram(
+                format_ok_html(
+                    payload.get("ev"),
+                    payload.get("token"),
+                    payload.get("quote"),
+                    payload.get("amount_in_h"),
+                    payload.get("out_h"),
+                    payload.get("px_str")
+                )
             )
-        )
+            publish_ping_ready_to_sqs(payload)
 
     except ClientError as e:
         if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
@@ -387,6 +448,7 @@ def lambda_handler(event: dict, context: Any=None) -> dict:
         recs = event.get("Records") or []
         if not recs and isinstance(event, dict) and "pool" in event:
             # прямий виклик (EventBridge Scheduler або локальний тест)
+            print(f"Event: {event}")
             return handle_ping_event(event)
         for r in recs:
             body = json.loads(r.get("body") or "{}")
