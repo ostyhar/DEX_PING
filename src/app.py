@@ -297,6 +297,7 @@ def ddb_put_status(idem: str, status: str, payload: dict) -> None:
                     payload.get("px_str")
                 )
             )
+            delete_schedule_if_present(ev)
             publish_ping_ready_to_sqs(payload)
 
     except ClientError as e:
@@ -434,7 +435,6 @@ def handle_ping_event(ev: dict) -> dict:
         "out_h": out_h,
         "px_str": px_str
     })
-    delete_schedule_if_present(ev)
     return {"ok": True, "out": out}
 
 # ---------- Lambda entry ----------
