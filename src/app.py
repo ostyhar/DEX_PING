@@ -104,6 +104,8 @@ factory    = w3.eth.contract(address=FACTORY,  abi=FACTORY_ABI)
 
 dynamodb = boto3.resource("dynamodb")
 lock_table = dynamodb.Table(DYNAMO_TABLE)
+AWS_REGION = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "eu-west-1"
+scheduler = boto3.client("scheduler", region_name=AWS_REGION)
 
 # ---------- Helpers ----------
 def erc20(address: str):
@@ -242,6 +244,22 @@ def ddb_put_status(idem: str, status: str, payload: dict) -> None:
         else:
             raise
 
+def delete_schedule_if_present(ev: dict) -> None:
+    """
+    Якщо в payload є scheduleName/scheduleGroup — пробуємо видалити шедул,
+    щоби зупинити подальші щохвилинні виклики.
+    """
+    name = ev.get("scheduleName")
+    group = ev.get("scheduleGroup")
+    if not (name and group):
+        return
+    try:
+        scheduler.delete_schedule(Name=name, GroupName=group)
+        print(f"[SCHED] deleted: {group}/{name}")
+    except Exception as e:
+        # Не валимо пінґ через це — просто лог
+        print(f"[SCHED][WARN] delete failed for {group}/{name}: {e}")
+
 def get_pool_and_direction(token_in: str, token_out: str, fee: int) -> Tuple[str, bool, int]:
     """
     Повертає (pool, oneForZero, sqrt_limit)
@@ -355,6 +373,7 @@ def handle_ping_event(ev: dict) -> dict:
         "out_h": out_h,
         "px_str": px_str
     })
+    delete_schedule_if_present(ev)
     return {"ok": True, "out": out}
 
 # ---------- Lambda entry ----------
@@ -379,26 +398,13 @@ def lambda_handler(event: dict, context: Any=None) -> dict:
 
 if __name__ == "__main__":
     import sys
-    hit = {
-        'token0': '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
-        'token1': '0xdA5e1988097297dCdc1f90D4dFE7909e847CBeF6',
-        'fee': 10000,
-        'tickSpacing': 200,
-        'pool': '0xCa2e972f081764c30Ae5F012A29D5277EEf33838',
-        'blockNumber': 23260820,
-        'blockHash': '0x6e6a65e48bc0d51a6024ab4fdd1475f258104e3f5488e933f243ee0db2101d46',
-        'txHash': '0xa2a3ee3aef9c80c80a3d44b15bfa17330b88a024a37fece70d08ac7bb0dafc2a',
-        'matched': '0xdA5e1988097297dCdc1f90D4dFE7909e847CBeF6',
-        'quote_symbol': 'WETH',
-        'initialized': True,
-        'init': {
-            'blockNumber': 23260820,
-            'txHash': '0xa2a3ee3aef9c80c80a3d44b15bfa17330b88a024a37fece70d08ac7bb0dafc2a',
-            'sqrtPriceX96': 11204090814846941428091632146247,
-            'tick': 99039
-        }
-    }
+
+    # WLFI
+    # data = {"version": 1, "event": "univ3.pool.created", "chainId": 1, "pool": "0xCa2e972f081764c30Ae5F012A29D5277EEf33838", "token": "0xdA5e1988097297dCdc1f90D4dFE7909e847CBeF6", "quote": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "fee": 10000, "createdBlock": 23260820, "createdBlockHash": "0x6e6a65e48bc0d51a6024ab4fdd1475f258104e3f5488e933f243ee0db2101d46", "createdTx": "0xa2a3ee3aef9c80c80a3d44b15bfa17330b88a024a37fece70d08ac7bb0dafc2a", "initialized": "true", "init": {"blockNumber": 23260820, "txHash": "0xa2a3ee3aef9c80c80a3d44b15bfa17330b88a024a37fece70d08ac7bb0dafc2a", "sqrtPriceX96": 11204090814846941428091632146247, "tick": 99039}, "quoteSymbol": "WETH", "idempotencyKey": "420cb78c293b37707db3c53a76dceff15d3dd1f1c5153c87b35a83950f0e932b", "createdAt": 1756647534, "scheduleName": "dex-ping-f33838-10000-420cb78c", "scheduleGroup": "dex-tokens"}
+    # PHA
+    data = {"version": 1, "event": "univ3.pool.created", "chainId": 1, "pool": "0x7bc5c9dE2DFe90CFE1e01967096915ba8ea1Bc53", "token": "0x6c5bA91642F10282b576d91922Ae6448C9d52f4E", "quote": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "fee": 10000, "createdBlock": 15561122, "createdBlockHash": "0x633f0d257cf64d5831d0b12c6ba66e9a72a754436f651fb2c7e98e670f8e429e", "createdTx": "0x5911e2ec786e5cd3d8896b1e1287d04d17666b8273506b3e7363389db64bf6dc", "initialized": "true", "init": {"blockNumber": 15561122, "txHash": "0x5911e2ec786e5cd3d8896b1e1287d04d17666b8273506b3e7363389db64bf6dc", "sqrtPriceX96": 657192322148935038807894396, "tick": -95847}, "quoteSymbol": "WETH", "idempotencyKey": "006a04c25e7d2f556d3bad380e508d3c38d34a7e62000115617e0d91a9404ba0", "createdAt": 1756651129, "scheduleName": "dex-ping-a1Bc53-10000-006a04c2", "scheduleGroup": "dex-tokens"}
+
     if data:
-        print(lambda_handler(hit))
+        print(lambda_handler(data))
     else:
         print("Provide JSON payload on stdin (single event or SQS Records).")
