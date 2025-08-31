@@ -367,7 +367,8 @@ def lambda_handler(event: dict, context: Any=None) -> dict:
     try:
         recs = event.get("Records") or []
         if not recs and isinstance(event, dict) and "pool" in event:
-            # прямий виклик для локального тесту
+            # прямий виклик (EventBridge Scheduler або локальний тест)
+            print(f"*** EVENT: {event}")
             return handle_ping_event(event)
         for r in recs:
             body = json.loads(r.get("body") or "{}")
