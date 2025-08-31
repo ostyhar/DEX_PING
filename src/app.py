@@ -297,7 +297,7 @@ def ddb_put_status(idem: str, status: str, payload: dict) -> None:
                     payload.get("px_str")
                 )
             )
-            delete_schedule_if_present(ev)
+            delete_schedule_if_present(payload.get("ev"))
             publish_ping_ready_to_sqs(payload)
 
     except ClientError as e:
