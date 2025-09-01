@@ -365,7 +365,6 @@ def handle_ping_event(ev: dict) -> dict:
     try:
         _pool_ok, _dir, sqrt_limit = get_pool_and_direction(ev["quote"], ev["token"], int(ev["fee"]))
     except Exception as e:
-        print(f"=========== ping_failed = Exception: {str(e)}")
         dynamo_db_put_status(
             ev.get("idempotencyKey","n/a"),
             "ping_failed",
@@ -387,7 +386,6 @@ def handle_ping_event(ev: dict) -> dict:
             used_amount = probe_amt
             used_probe  = True
         else:
-            print(f"=========== ping_failed = реверт або out==0 — «маленька проба»")
             dynamo_db_put_status(ev.get("idempotencyKey","n/a"), "ping_failed", {
                 "ev": ev,
                 "token": sym_out,
@@ -399,7 +397,6 @@ def handle_ping_event(ev: dict) -> dict:
             return {"error": err2 or err or "quote=0"}
 
     if out <= 0:
-        print(f"=========== ping_failed = out <= 0")
         dynamo_db_put_status(ev.get("idempotencyKey","n/a"), "ping_failed", {
             "ev": ev,
             "token": sym_out,
