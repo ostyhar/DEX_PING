@@ -90,9 +90,21 @@ TELEGRAM_DISABLE_WEB_PAGE_PREVIEW = os.getenv("TELEGRAM_DISABLE_WEB_PAGE_PREVIEW
 
 # Скільки котирувати (людські одиниці квот-токена, напр. 1.0 USDT або 0.2 WETH)
 TARGET_SWAP_AMOUNT = Decimal(os.getenv("TARGET_SWAP_AMOUNT","0") or "0")
+
+# Скільки котирувати (людські одиниці квот-токена)
+# Варіант 1 (як було): TARGET_SWAP_AMOUNT — сума в ОДИНИЦЯХ quote-токена (напр. 0.2 WETH або 1.0 USDT)
+TARGET_SWAP_AMOUNT = Decimal(os.getenv("TARGET_SWAP_AMOUNT","0") or "0")
+# Варіант 2 (нова логіка): TARGET_SWAP_AMOUNT_USDT — сума в USDT.
+# Якщо quote=USDT — беремо її напряму; якщо quote=WETH — беремо еквівалент у WETH по ціні WETH→USDT (Uniswap v3).
+TARGET_SWAP_AMOUNT_USDT = Decimal(os.getenv("TARGET_SWAP_AMOUNT_USDT","0") or "0")
+
 # Якщо базова квота впала — зробити пробу на PROBE_BPS від суми (напр. 500 = 5%)
 PROBE_BPS = int(os.getenv("PROBE_BPS","500") or "0")
 SWAP_SQS_FIFO_URL = os.getenv("SWAP_SQS_FIFO_URL","").strip()
+
+# Адреси основних токенів (Ethereum mainnet)
+ADDR_WETH = Web3.to_checksum_address("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2")
+ADDR_USDT = Web3.to_checksum_address("0xdAC17F958D2ee523a2206206994597C13D831ec7")
 
 # ---------- Clients ----------
 w3 = Web3(Web3.HTTPProvider(RPC_URL, request_kwargs={"timeout": 15}))
@@ -118,6 +130,23 @@ def get_decimals(addr: str) -> int:
         return int(erc20(addr).functions.decimals().call())
     except Exception:
         return 18
+
+def _try_quote_best(token_in: str, token_out: str, tiers=(500, 3000, 10000), amount_in_wei: int = 10**18) -> Tuple[int, int]:
+    """
+    Квотує amount_in_wei через найкращий доступний fee tier із переліку.
+    Повертає (amountOut, used_fee). Кидає помилку, якщо пулів немає.
+    """
+    last_err = None
+    for fee in tiers:
+        try:
+            _, _, sqrt_limit = get_pool_and_direction(token_in, token_out, fee)
+            out, err = quote_single(token_in, token_out, fee, int(amount_in_wei), sqrt_limit)
+            if err is None and out > 0:
+                return out, fee
+            last_err = Exception(err or "quote=0")
+        except Exception as e:
+            print("No pool/quote available for requested pair")
+            continue
 
 def get_token_symbol(w3: Web3, addr: str) -> str:
     addr = Web3.to_checksum_address(addr)
@@ -353,11 +382,48 @@ def handle_ping_event(ev: dict) -> dict:
     for k in ("pool","token","quote","fee"):
         if not ev.get(k):
             return {"skipped":"bad_payload"}
-    if TARGET_SWAP_AMOUNT <= 0:
-        return {"skipped":"target_amount_not_set"}
-    # in-amount у wei (за QUOTE-токеном)
-    q_dec = get_decimals(ev.get("quote"))
-    amount_in = int((TARGET_SWAP_AMOUNT * (Decimal(10) ** q_dec)).to_integral_value())
+    # if TARGET_SWAP_AMOUNT <= 0:
+    #     return {"skipped":"target_amount_not_set"}
+    # # in-amount у wei (за QUOTE-токеном)
+    # q_dec = get_decimals(ev.get("quote"))
+    # amount_in = int((TARGET_SWAP_AMOUNT * (Decimal(10) ** q_dec)).to_integral_value())
+
+    # Визначаємо цільову суму котирування
+    quote_addr = Web3.to_checksum_address(ev.get("quote"))
+    q_dec = get_decimals(quote_addr)
+
+    amount_in = 0
+    used_from = "TARGET_SWAP_AMOUNT"
+
+    if TARGET_SWAP_AMOUNT_USDT > 0:
+        # якщо quote = USDT — беремо суму напряму
+        if quote_addr == ADDR_USDT:
+            amount_in = int((TARGET_SWAP_AMOUNT_USDT * (Decimal(10) ** q_dec)).to_integral_value())
+            used_from = "TARGET_SWAP_AMOUNT_USDT (USDT direct)"
+        # якщо quote = WETH — розраховуємо еквівалент у WETH по ціні WETH→USDT
+        elif quote_addr == ADDR_WETH:
+            try:
+                # кворимо 1 WETH -> USDT, щоб отримати USDT_per_WETH
+                out_usdt_wei, used_fee = _try_quote_best(ADDR_WETH, ADDR_USDT, tiers=(500, 3000, 10000), amount_in_wei=10**18)
+                usdt_dec = get_decimals(ADDR_USDT)
+                usdt_per_weth = (Decimal(out_usdt_wei) / (Decimal(10) ** usdt_dec))
+                if usdt_per_weth <= 0:
+                    return {"skipped":"WETH/USDT price <= 0"}
+                weth_amount = (TARGET_SWAP_AMOUNT_USDT / usdt_per_weth)  # у WETH
+                amount_in = int((weth_amount * (Decimal(10) ** q_dec)).to_integral_value())  # у wei WETH
+                used_from = f"TARGET_SWAP_AMOUNT_USDT (via WETH@{used_fee})"
+            except Exception as e:
+                print(f"[PING] WETH<->USDT quote failed: {e} — fallback to TARGET_SWAP_AMOUNT")
+                # впадем у звичайний TARGET_SWAP_AMOUNT нижче
+
+    # якщо ще не встановили — fallback на старий механізм
+    if amount_in <= 0:
+        if TARGET_SWAP_AMOUNT <= 0:
+            return {"skipped":"target_amount_not_set"}
+        amount_in = int((TARGET_SWAP_AMOUNT * (Decimal(10) ** q_dec)).to_integral_value())
+        used_from = "TARGET_SWAP_AMOUNT"
+
+
     sym_out = get_token_symbol(w3, ev.get("token"))
     sym_in  = ev.get("quote_symbol") or get_token_symbol(w3, ev.get("quote"))
    
@@ -428,6 +494,7 @@ def handle_ping_event(ev: dict) -> dict:
         dynamo_db_put_status(ev.get("idempotencyKey","n/a"), "ping_ready", payload)
     except Exception:
         raise
+    print(f"[PING] amount_in source: {used_from}")
     return {"ok": True, "out": out}
 
 # ---------- Lambda entry ----------
