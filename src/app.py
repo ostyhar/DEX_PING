@@ -260,7 +260,7 @@ def format_fail_html(ev: dict, err: str) -> str:
         parts.append(f"🔗 <a href=\"https://etherscan.io/address/{pool}\">pool</a>")
     return "\n".join(parts)
 
-def ddb_put_status(idem: str, status: str, payload: dict) -> None:
+def dynamo_db_put_status(idem, status, payload):
     """
     Пише запис у swap_events з простим дедупом: перший запис перемагає.
     Якщо елемент із таким `id` вже існує — ігноруємо повтор (ретраї SQS тощо).
@@ -366,19 +366,16 @@ def handle_ping_event(ev: dict) -> dict:
     for k in ("pool","token","quote","fee"):
         if not ev.get(k):
             return {"skipped":"bad_payload"}
-
     if TARGET_SWAP_AMOUNT <= 0:
         return {"skipped":"target_amount_not_set"}
-
     # in-amount у wei (за QUOTE-токеном)
     q_dec = get_decimals(ev.get("quote"))
     amount_in = int((TARGET_SWAP_AMOUNT * (Decimal(10) ** q_dec)).to_integral_value())
-
     # Визначаємо напрямок і коректний sqrt limit
     try:
         _pool_ok, _dir, sqrt_limit = get_pool_and_direction(ev["quote"], ev["token"], int(ev["fee"]))
     except Exception as e:
-        ddb_put_status(ev.get("idempotencyKey","n/a"), "ping_failed", {"ev": ev, "error": str(e)})
+        dynamo_db_put_status(ev.get("idempotencyKey","n/a"), "ping_failed", {"ev": ev, "error": str(e)})
         send_telegram(format_fail_html(ev, f"pool/direction: {e}"))
         return {"error": str(e)}
 
@@ -396,7 +393,7 @@ def handle_ping_event(ev: dict) -> dict:
             used_amount = probe_amt
             used_probe  = True
         else:
-            ddb_put_status(ev.get("idempotencyKey","n/a"), "ping_failed", {
+            dynamo_db_put_status(ev.get("idempotencyKey","n/a"), "ping_failed", {
                 "ev": ev,
                 "error": err2 or err or "quote returned 0",
                 "amount_in": str(amount_in),
@@ -406,7 +403,7 @@ def handle_ping_event(ev: dict) -> dict:
             return {"error": err2 or err or "quote=0"}
 
     if out <= 0:
-        ddb_put_status(ev.get("idempotencyKey","n/a"), "ping_failed", {
+        dynamo_db_put_status(ev.get("idempotencyKey","n/a"), "ping_failed", {
             "ev": ev,
             "error": err or "quote returned 0",
             "amount_in": str(amount_in),
@@ -422,19 +419,22 @@ def handle_ping_event(ev: dict) -> dict:
     px_str      = price_str(used_amount, q_dec, out, t_dec)
     sym_out = get_token_symbol(w3, ev.get("token"))
     sym_in  = ev.get("quote_symbol") or get_token_symbol(w3, ev.get("quote"))
-
     # Зберігаємо в DDB
-    ddb_put_status(ev.get("idempotencyKey","n/a"), "ping_ready", {
-        "ev": ev,
-        "token": sym_out,
-        "quote": sym_in,
-        "amount_in": str(used_amount),
-        "amount_out": str(out),
-        "probe_used": used_probe,
-        "amount_in_h": amount_in_h,
-        "out_h": out_h,
-        "px_str": px_str
-    })
+    try:
+        payload = {
+            "ev": ev,
+            "token": sym_out,
+            "quote": sym_in,
+            "amount_in": str(used_amount),
+            "amount_out": str(out),
+            "probe_used": used_probe,
+            "amount_in_h": amount_in_h,
+            "out_h": out_h,
+            "px_str": px_str
+        }
+        dynamo_db_put_status(ev.get("idempotencyKey","n/a"), "ping_ready", payload)
+    except Exception:
+        raise
     return {"ok": True, "out": out}
 
 # ---------- Lambda entry ----------
