@@ -247,12 +247,12 @@ def format_ok_html(ev: dict, token:str, quote: str, amount_in_h: Decimal, out_h:
         parts.append(f"🔗 <a href=\"https://etherscan.io/address/{pool}\">pool</a>")
     return "\n".join(parts)
 
-def format_fail_html(ev: dict, err: str) -> str:
+def format_fail_html(ev: dict, tocken:str, quote:str, err: str) -> str:
     name = ev.get("name") or ev.get("token") or "?"
     fee  = ev.get("fee")
     pool = ev.get("pool")
     parts = [
-        f"❌ <b>DEX Ping failed</b> • {name}",
+        f"❌ <b>DEX Ping failed</b> • {tocken}/{quote}",
         f"💱 fee: <code>{fee}</code>",
         f"⚠️ {err}",
     ]
@@ -286,6 +286,15 @@ def dynamo_db_put_status(idem, status, payload):
             ExpressionAttributeNames={"#id": "id"},
         )
         print(f"[DDB] put {status} id={_id} OK")
+        if status == "ping_failed":
+            send_telegram(
+                format_fail_html(
+                    ev,
+                    payload.get("token"),
+                    payload.get("quote"),                    
+                    err2 or err or "quote=0"
+                )
+            )
         if status == "ping_ready":
             send_telegram(
                 format_ok_html(
@@ -371,12 +380,19 @@ def handle_ping_event(ev: dict) -> dict:
     # in-amount у wei (за QUOTE-токеном)
     q_dec = get_decimals(ev.get("quote"))
     amount_in = int((TARGET_SWAP_AMOUNT * (Decimal(10) ** q_dec)).to_integral_value())
+    sym_out = get_token_symbol(w3, ev.get("token"))
+    sym_in  = ev.get("quote_symbol") or get_token_symbol(w3, ev.get("quote"))
+   
     # Визначаємо напрямок і коректний sqrt limit
     try:
         _pool_ok, _dir, sqrt_limit = get_pool_and_direction(ev["quote"], ev["token"], int(ev["fee"]))
     except Exception as e:
-        dynamo_db_put_status(ev.get("idempotencyKey","n/a"), "ping_failed", {"ev": ev, "error": str(e)})
-        send_telegram(format_fail_html(ev, f"pool/direction: {e}"))
+        dynamo_db_put_status(
+            ev.get("idempotencyKey","n/a"),
+            "ping_failed",
+            {"ev": ev, "token": sym_out, "quote": sym_in, "error": str(e)}
+        )
+        # send_telegram(format_fail_html(ev, sym_out, sym_in, f"pool/direction: {e}"))
         return {"error": str(e)}
 
     # Основна квота
@@ -395,21 +411,24 @@ def handle_ping_event(ev: dict) -> dict:
         else:
             dynamo_db_put_status(ev.get("idempotencyKey","n/a"), "ping_failed", {
                 "ev": ev,
+                "token": sym_out,
+                "quote": sym_in,
                 "error": err2 or err or "quote returned 0",
                 "amount_in": str(amount_in),
                 "probe_bps": PROBE_BPS
             })
-            send_telegram(format_fail_html(ev, err2 or err or "quote=0"))
             return {"error": err2 or err or "quote=0"}
 
     if out <= 0:
         dynamo_db_put_status(ev.get("idempotencyKey","n/a"), "ping_failed", {
             "ev": ev,
+            "token": sym_out,
+            "quote": sym_in,
             "error": err or "quote returned 0",
             "amount_in": str(amount_in),
             "probe_used": used_probe
         })
-        send_telegram(format_fail_html(ev, err or "quote=0"))
+        # send_telegram(format_fail_html(ev, err or "quote=0"))
         return {"error": err or "quote=0"}
 
     # Красиві числа і ціна
@@ -417,8 +436,8 @@ def handle_ping_event(ev: dict) -> dict:
     amount_in_h = human_amount(used_amount, q_dec)
     out_h       = human_amount(out, t_dec)
     px_str      = price_str(used_amount, q_dec, out, t_dec)
-    sym_out = get_token_symbol(w3, ev.get("token"))
-    sym_in  = ev.get("quote_symbol") or get_token_symbol(w3, ev.get("quote"))
+    # sym_out = get_token_symbol(w3, ev.get("token"))
+    # sym_in  = ev.get("quote_symbol") or get_token_symbol(w3, ev.get("quote"))
     # Зберігаємо в DDB
     try:
         payload = {
