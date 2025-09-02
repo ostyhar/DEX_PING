@@ -105,6 +105,7 @@ SWAP_SQS_FIFO_URL = os.getenv("SWAP_SQS_FIFO_URL","").strip()
 # Адреси основних токенів (Ethereum mainnet)
 ADDR_WETH = Web3.to_checksum_address("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2")
 ADDR_USDT = Web3.to_checksum_address("0xdAC17F958D2ee523a2206206994597C13D831ec7")
+ADDR_USDC = Web3.to_checksum_address("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
 
 # ---------- Clients ----------
 w3 = Web3(Web3.HTTPProvider(RPC_URL, request_kwargs={"timeout": 15}))
@@ -400,6 +401,10 @@ def handle_ping_event(ev: dict) -> dict:
         if quote_addr == ADDR_USDT:
             amount_in = int((TARGET_SWAP_AMOUNT_USDT * (Decimal(10) ** q_dec)).to_integral_value())
             used_from = "TARGET_SWAP_AMOUNT_USDT (USDT direct)"
+        elif quote_addr == ADDR_USDC:
+            # USDC тримаємо 1:1 до USD → беремо суму напряму
+            amount_in = int((TARGET_SWAP_AMOUNT_USDT * (Decimal(10) ** q_dec)).to_integral_value())
+            used_from = "TARGET_SWAP_AMOUNT_USDT (USDC direct)"
         # якщо quote = WETH — розраховуємо еквівалент у WETH по ціні WETH→USDT
         elif quote_addr == ADDR_WETH:
             try:
